@@ -6,7 +6,9 @@ import os
 import platform
 import re
 import socket
+import sys
 import uuid
+from json import dumps
 from typing import Any, Optional
 
 from aiogithubapi import (
@@ -42,6 +44,59 @@ class System(Base):
         """Get boot time"""
         return boot_time()
 
+    def camera_usage(self) -> list[str]:
+        """Returns a list of apps that are currently using the webcam."""
+        active_apps = []
+        if sys.platform == "win32":
+            # Read from registry for camera usage
+            import winreg  # pylint: disable=import-error,import-outside-toplevel
+
+            subkey_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"
+
+            def get_subkey_timestamp(subkey) -> int | None:
+                """Returns the timestamp of the subkey"""
+                try:
+                    value, _ = winreg.QueryValueEx(subkey, "LastUsedTimeStop")
+                    return value
+                except OSError:
+                    pass
+                return None
+
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey_path)
+                # Enumerate over the subkeys of the webcam key
+                subkey_count, _, _ = winreg.QueryInfoKey(key)
+                # Recursively open each subkey and check the "LastUsedTimeStop" value.
+                # A value of 0 means the camera is currently in use.
+                for idx in range(subkey_count):
+                    subkey_name = winreg.EnumKey(key, idx)
+                    subkey_name_full = f"{subkey_path}\\{subkey_name}"
+                    subkey = winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey_name_full)
+                    if subkey_name == "NonPackaged":
+                        # Enumerate over the subkeys of the "NonPackaged" key
+                        subkey_count, _, _ = winreg.QueryInfoKey(subkey)
+                        for np_idx in range(subkey_count):
+                            subkey_name_np = winreg.EnumKey(subkey, np_idx)
+                            subkey_name_full_np = (
+                                f"{subkey_path}\\NonPackaged\\{subkey_name_np}"
+                            )
+                            subkey_np = winreg.OpenKey(
+                                winreg.HKEY_CURRENT_USER, subkey_name_full_np
+                            )
+                            if get_subkey_timestamp(subkey_np) == 0:
+                                active_apps.append(subkey_name_np)
+                    else:
+                        if get_subkey_timestamp(subkey) == 0:
+                            active_apps.append(subkey_name)
+                    winreg.CloseKey(subkey)
+                winreg.CloseKey(key)
+            except OSError:
+                pass
+        elif sys.platform in ["darwin", "linux"]:
+            # Unknown, please open an issue or PR if you know how to do this
+            pass
+        return active_apps
+
     def fqdn(self) -> str:
         """Get FQDN"""
         return socket.getfqdn()
@@ -72,6 +127,71 @@ class System(Base):
         """Get MAC address"""
         # pylint: disable=consider-using-f-string
         return ":".join(re.findall("..", "%012x" % uuid.getnode()))
+
+    def pending_restart(self) -> bool:
+        """Check if there is a pending restart"""
+        if sys.platform == "win32":
+            # Read from registry for pending restart
+            import winreg  # pylint: disable=import-error,import-outside-toplevel
+
+            reg = winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE)
+            # Check for "Reboot Required" keys
+            try:
+                key = winreg.OpenKey(
+                    reg,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+                )
+                winreg.CloseKey(key)
+                return True
+            except OSError:
+                pass
+            try:
+                key = winreg.OpenKey(
+                    reg,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+                )
+                winreg.CloseKey(key)
+                return True
+            except OSError:
+                pass
+            # Check for recent installation requiring reboot
+            try:
+                key = winreg.OpenKey(
+                    reg,
+                    r"SOFTWARE\Microsoft\Updates\UpdateExeVolatile",
+                )
+                winreg.CloseKey(key)
+                return True
+            except OSError:
+                pass
+            # Check for System Center Configuration Manager
+            try:
+                key = winreg.OpenKey(
+                    reg,
+                    r"SOFTWARE\Microsoft\SMS\Mobile Client\Reboot Management\RebootData",
+                )
+                winreg.CloseKey(key)
+                return True
+            except OSError:
+                pass
+            # Check for pending file rename operations
+            try:
+                key = winreg.OpenKey(
+                    reg,
+                    r"SYSTEM\CurrentControlSet\Control\Session Manager",
+                )
+                value, _ = winreg.QueryValueEx(key, "PendingFileRenameOperations")
+                winreg.CloseKey(key)
+                if value:
+                    return True
+            except OSError:
+                pass
+        elif sys.platform in ["darwin", "linux"]:
+            if os.path.exists("/var/run/reboot-required"):
+                return True
+            if os.path.exists("/var/run/reboot-required.pkgs"):
+                return True
+        return False
 
     def platform(self) -> str:
         """Get platform"""
@@ -177,6 +297,16 @@ class SystemUpdate(ModuleUpdateBase):
             ),
         )
 
+    async def update_camera_usage(self) -> None:
+        """Update camera usage"""
+        self._database.update_data(
+            DatabaseModel,
+            DatabaseModel(
+                key="camera_usage",
+                value=dumps(self._system.camera_usage()),
+            ),
+        )
+
     async def update_fqdn(self) -> None:
         """Update FQDN"""
         self._database.update_data(
@@ -224,6 +354,16 @@ class SystemUpdate(ModuleUpdateBase):
             DatabaseModel(
                 key="mac_address",
                 value=self._system.mac_address(),
+            ),
+        )
+
+    async def update_pending_restart(self) -> None:
+        """Update pending restart"""
+        self._database.update_data(
+            DatabaseModel,
+            DatabaseModel(
+                key="pending_restart",
+                value=str(self._system.pending_restart()),
             ),
         )
 
@@ -321,11 +461,13 @@ class SystemUpdate(ModuleUpdateBase):
                 self.update_active_user_id(),
                 self.update_active_user_name(),
                 self.update_boot_time(),
+                self.update_camera_usage(),
                 self.update_fqdn(),
                 self.update_hostname(),
                 self.update_ip_address_4(),
                 self.update_ip_address_6(),
                 self.update_mac_address(),
+                self.update_pending_restart(),
                 self.update_platform(),
                 self.update_platform_version(),
                 self.update_uptime(),
